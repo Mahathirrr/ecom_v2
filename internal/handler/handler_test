@@ -1,0 +1,1026 @@
+package handler
+
+import (
+	"bytes"
+	"context"
+	"ecom_apiv1/internal/server"
+	"ecom_apiv1/internal/storer"
+	"ecom_apiv1/token"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
+	"testing"
+	"time"
+
+	"github.com/gorilla/mux"
+	"gorm.io/driver/sqlite"
+	"gorm.io/gorm"
+)
+
+// TestHandler adalah struct untuk menyimpan dependencies yang dibutuhkan untuk testing
+type TestHandler struct {
+	handler    *handler
+	db         *gorm.DB
+	testServer *server.Server
+	router     *mux.Router
+}
+
+// setupTestHandler membuat instance handler untuk testing dengan database in-memory
+func setupTestHandler(t *testing.T) *TestHandler {
+	// Membuat database SQLite in-memory untuk testing
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("Failed to connect to test database: %v", err)
+	}
+
+	// Auto migrate semua tabel yang dibutuhkan
+	err = db.AutoMigrate(&storer.Product{}, &storer.User{}, &storer.Order{}, &storer.OrderItem{}, &storer.Session{})
+	if err != nil {
+		t.Fatalf("Failed to migrate test database: %v", err)
+	}
+
+	// Membuat storage dan server instance
+	storage := storer.NewGORMStorage(db)
+	testServer := server.NewServer(storage)
+
+	// Membuat handler dengan secret key untuk testing
+	secretKey := "test-secret-key-that-is-long-enough-for-jwt-signing-minimum-32-chars"
+	h := NewHandler(testServer, secretKey)
+
+	// Setup routes
+	router := RegisterRoutes(h)
+
+	return &TestHandler{
+		handler:    h,
+		db:         db,
+		testServer: testServer,
+		router:     router,
+	}
+}
+
+// createTestUser membuat user untuk testing dan mengembalikan user beserta tokennya
+func (th *TestHandler) createTestUser(t *testing.T, isAdmin bool) (*storer.User, string) {
+	user := &storer.User{
+		Name:     "Test User",
+		Email:    "test@example.com",
+		Password: "$2a$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LewdBPj/VcSAg/9qm", // hashed "password123"
+		IsAdmin:  isAdmin,
+	}
+
+	// Simpan user ke database
+	createdUser, err := th.testServer.CreateUser(context.Background(), user)
+	if err != nil {
+		t.Fatalf("Failed to create test user: %v", err)
+	}
+
+	// Buat access token untuk user
+	accessToken, _, err := th.handler.TokenMaker.CreateToken(
+		createdUser.ID,
+		createdUser.Email,
+		createdUser.IsAdmin,
+		time.Hour,
+	)
+	if err != nil {
+		t.Fatalf("Failed to create access token: %v", err)
+	}
+
+	return createdUser, accessToken
+}
+
+// createTestProduct membuat product untuk testing
+func (th *TestHandler) createTestProduct(t *testing.T) *storer.Product {
+	product := &storer.Product{
+		Name:         "Test Product",
+		Image:        "https://example.com/image.jpg",
+		Category:     "Electronics",
+		Description:  "Test product description",
+		Rating:       5,
+		NumReviews:   10,
+		Price:        99.99,
+		CountInStock: 50,
+	}
+
+	createdProduct, err := th.testServer.CreateProduct(context.Background(), product)
+	if err != nil {
+		t.Fatalf("Failed to create test product: %v", err)
+	}
+
+	return createdProduct
+}
+
+// makeRequest adalah helper function untuk membuat HTTP request dengan authorization header
+func (th *TestHandler) makeRequest(method, url string, body interface{}, token string) *httptest.ResponseRecorder {
+	var reqBody bytes.Buffer
+	if body != nil {
+		json.NewEncoder(&reqBody).Encode(body)
+	}
+
+	req := httptest.NewRequest(method, url, &reqBody)
+	req.Header.Set("Content-Type", "application/json")
+	
+	// Tambahkan authorization header jika token disediakan
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+
+	rr := httptest.NewRecorder()
+	th.router.ServeHTTP(rr, req)
+	return rr
+}
+
+// ==================== PRODUCT HANDLER TESTS ====================
+
+// TestCreateProduct menguji endpoint untuk membuat product baru (admin only)
+func TestCreateProduct(t *testing.T) {
+	th := setupTestHandler(t)
+
+	// Test case 1: Sukses membuat product sebagai admin
+	t.Run("Success - Admin creates product", func(t *testing.T) {
+		_, adminToken := th.createTestUser(t, true) // Buat admin user
+
+		productReq := ProductReq{
+			Name:         "New Product",
+			Image:        "https://example.com/new-image.jpg",
+			Category:     "Books",
+			Description:  "A great book",
+			Rating:       4,
+			NumReviews:   5,
+			Price:        29.99,
+			CountInStock: 100,
+		}
+
+		rr := th.makeRequest("POST", "/products", productReq, adminToken)
+
+		// Verifikasi response status
+		if rr.Code != http.StatusOK {
+			t.Errorf("Expected status %d, got %d", http.StatusOK, rr.Code)
+		}
+
+		// Parse response body
+		var response ProductRes
+		err := json.NewDecoder(rr.Body).Decode(&response)
+		if err != nil {
+			t.Fatalf("Failed to decode response: %v", err)
+		}
+
+		// Verifikasi data response
+		if response.Name != productReq.Name {
+			t.Errorf("Expected name %s, got %s", productReq.Name, response.Name)
+		}
+		if response.Price != productReq.Price {
+			t.Errorf("Expected price %f, got %f", productReq.Price, response.Price)
+		}
+	})
+
+	// Test case 2: Gagal karena bukan admin
+	t.Run("Fail - Non-admin tries to create product", func(t *testing.T) {
+		_, userToken := th.createTestUser(t, false) // Buat regular user
+
+		productReq := ProductReq{
+			Name:         "New Product",
+			Image:        "https://example.com/new-image.jpg",
+			Category:     "Books",
+			Description:  "A great book",
+			Rating:       4,
+			NumReviews:   5,
+			Price:        29.99,
+			CountInStock: 100,
+		}
+
+		rr := th.makeRequest("POST", "/products", productReq, userToken)
+
+		// Harus mendapat status Forbidden
+		if rr.Code != http.StatusForbidden {
+			t.Errorf("Expected status %d, got %d", http.StatusForbidden, rr.Code)
+		}
+	})
+
+	// Test case 3: Gagal karena validasi error
+	t.Run("Fail - Validation error", func(t *testing.T) {
+		_, adminToken := th.createTestUser(t, true)
+
+		// Product dengan data tidak valid (nama terlalu pendek)
+		productReq := ProductReq{
+			Name:         "AB", // Terlalu pendek (min 3 karakter)
+			Image:        "invalid-url", // URL tidak valid
+			Category:     "Books",
+			Description:  "A great book",
+			Rating:       4,
+			NumReviews:   5,
+			Price:        0, // Price harus > 0
+			CountInStock: 100,
+		}
+
+		rr := th.makeRequest("POST", "/products", productReq, adminToken)
+
+		// Harus mendapat status Bad Request
+		if rr.Code != http.StatusBadRequest {
+			t.Errorf("Expected status %d, got %d", http.StatusBadRequest, rr.Code)
+		}
+	})
+}
+
+// TestGetProduct menguji endpoint untuk mendapatkan product berdasarkan ID
+func TestGetProduct(t *testing.T) {
+	th := setupTestHandler(t)
+
+	// Test case 1: Sukses mendapatkan product
+	t.Run("Success - Get existing product", func(t *testing.T) {
+		// Buat product terlebih dahulu
+		product := th.createTestProduct(t)
+
+		rr := th.makeRequest("GET", "/products/"+strconv.Itoa(int(product.ID)), nil, "")
+
+		// Verifikasi response status
+		if rr.Code != http.StatusOK {
+			t.Errorf("Expected status %d, got %d", http.StatusOK, rr.Code)
+		}
+
+		// Parse response body
+		var response ProductRes
+		err := json.NewDecoder(rr.Body).Decode(&response)
+		if err != nil {
+			t.Fatalf("Failed to decode response: %v", err)
+		}
+
+		// Verifikasi data response
+		if response.ID != product.ID {
+			t.Errorf("Expected ID %d, got %d", product.ID, response.ID)
+		}
+		if response.Name != product.Name {
+			t.Errorf("Expected name %s, got %s", product.Name, response.Name)
+		}
+	})
+
+	// Test case 2: Gagal karena ID tidak valid
+	t.Run("Fail - Invalid ID format", func(t *testing.T) {
+		rr := th.makeRequest("GET", "/products/invalid-id", nil, "")
+
+		// Harus mendapat status Bad Request
+		if rr.Code != http.StatusBadRequest {
+			t.Errorf("Expected status %d, got %d", http.StatusBadRequest, rr.Code)
+		}
+	})
+}
+
+// TestListProducts menguji endpoint untuk mendapatkan daftar semua products
+func TestListProducts(t *testing.T) {
+	th := setupTestHandler(t)
+
+	// Test case 1: Sukses mendapatkan daftar products
+	t.Run("Success - List all products", func(t *testing.T) {
+		// Buat beberapa products
+		th.createTestProduct(t)
+		th.createTestProduct(t)
+
+		rr := th.makeRequest("GET", "/products", nil, "")
+
+		// Verifikasi response status
+		if rr.Code != http.StatusOK {
+			t.Errorf("Expected status %d, got %d", http.StatusOK, rr.Code)
+		}
+
+		// Parse response body
+		var response []ProductRes
+		err := json.NewDecoder(rr.Body).Decode(&response)
+		if err != nil {
+			t.Fatalf("Failed to decode response: %v", err)
+		}
+
+		// Verifikasi jumlah products
+		if len(response) < 2 {
+			t.Errorf("Expected at least 2 products, got %d", len(response))
+		}
+	})
+}
+
+// TestUpdateProduct menguji endpoint untuk mengupdate product (admin only)
+func TestUpdateProduct(t *testing.T) {
+	th := setupTestHandler(t)
+
+	// Test case 1: Sukses update product sebagai admin
+	t.Run("Success - Admin updates product", func(t *testing.T) {
+		_, adminToken := th.createTestUser(t, true)
+		product := th.createTestProduct(t)
+
+		updateReq := ProductReq{
+			Name:         "Updated Product Name",
+			Image:        "https://example.com/updated-image.jpg",
+			Category:     "Updated Category",
+			Description:  "Updated description",
+			Rating:       3,
+			NumReviews:   15,
+			Price:        149.99,
+			CountInStock: 25,
+		}
+
+		rr := th.makeRequest("PATCH", "/products/"+strconv.Itoa(int(product.ID)), updateReq, adminToken)
+
+		// Verifikasi response status
+		if rr.Code != http.StatusOK {
+			t.Errorf("Expected status %d, got %d", http.StatusOK, rr.Code)
+		}
+
+		// Parse response body
+		var response ProductRes
+		err := json.NewDecoder(rr.Body).Decode(&response)
+		if err != nil {
+			t.Fatalf("Failed to decode response: %v", err)
+		}
+
+		// Verifikasi data telah diupdate
+		if response.Name != updateReq.Name {
+			t.Errorf("Expected name %s, got %s", updateReq.Name, response.Name)
+		}
+		if response.Price != updateReq.Price {
+			t.Errorf("Expected price %f, got %f", updateReq.Price, response.Price)
+		}
+	})
+}
+
+// TestDeleteProduct menguji endpoint untuk menghapus product (admin only)
+func TestDeleteProduct(t *testing.T) {
+	th := setupTestHandler(t)
+
+	// Test case 1: Sukses delete product sebagai admin
+	t.Run("Success - Admin deletes product", func(t *testing.T) {
+		_, adminToken := th.createTestUser(t, true)
+		product := th.createTestProduct(t)
+
+		rr := th.makeRequest("DELETE", "/products/"+strconv.Itoa(int(product.ID)), nil, adminToken)
+
+		// Verifikasi response status
+		if rr.Code != http.StatusNoContent {
+			t.Errorf("Expected status %d, got %d", http.StatusNoContent, rr.Code)
+		}
+	})
+
+	// Test case 2: Gagal delete product yang tidak ada
+	t.Run("Fail - Delete non-existent product", func(t *testing.T) {
+		_, adminToken := th.createTestUser(t, true)
+
+		rr := th.makeRequest("DELETE", "/products/99999", nil, adminToken)
+
+		// Harus mendapat status Not Found
+		if rr.Code != http.StatusNotFound {
+			t.Errorf("Expected status %d, got %d", http.StatusNotFound, rr.Code)
+		}
+	})
+}
+
+// ==================== USER HANDLER TESTS ====================
+
+// TestCreateUser menguji endpoint untuk registrasi user baru
+func TestCreateUser(t *testing.T) {
+	th := setupTestHandler(t)
+
+	// Test case 1: Sukses membuat user baru
+	t.Run("Success - Create new user", func(t *testing.T) {
+		userReq := UserReq{
+			Name:     "John Doe",
+			Email:    "john@example.com",
+			Password: "password123",
+			IsAdmin:  false,
+		}
+
+		rr := th.makeRequest("POST", "/users", userReq, "")
+
+		// Verifikasi response status
+		if rr.Code != http.StatusCreated {
+			t.Errorf("Expected status %d, got %d", http.StatusCreated, rr.Code)
+		}
+
+		// Parse response body
+		var response UserRes
+		err := json.NewDecoder(rr.Body).Decode(&response)
+		if err != nil {
+			t.Fatalf("Failed to decode response: %v", err)
+		}
+
+		// Verifikasi data response
+		if response.Name != userReq.Name {
+			t.Errorf("Expected name %s, got %s", userReq.Name, response.Name)
+		}
+		if response.Email != userReq.Email {
+			t.Errorf("Expected email %s, got %s", userReq.Email, response.Email)
+		}
+		// Password tidak boleh dikembalikan dalam response
+	})
+
+	// Test case 2: Gagal karena validasi error
+	t.Run("Fail - Validation error", func(t *testing.T) {
+		userReq := UserReq{
+			Name:     "Jo", // Terlalu pendek
+			Email:    "invalid-email", // Email tidak valid
+			Password: "123", // Password terlalu pendek
+			IsAdmin:  false,
+		}
+
+		rr := th.makeRequest("POST", "/users", userReq, "")
+
+		// Harus mendapat status Bad Request
+		if rr.Code != http.StatusBadRequest {
+			t.Errorf("Expected status %d, got %d", http.StatusBadRequest, rr.Code)
+		}
+	})
+}
+
+// TestLoginUser menguji endpoint untuk login user
+func TestLoginUser(t *testing.T) {
+	th := setupTestHandler(t)
+
+	// Test case 1: Sukses login dengan kredensial yang benar
+	t.Run("Success - Login with correct credentials", func(t *testing.T) {
+		// Buat user terlebih dahulu
+		user, _ := th.createTestUser(t, false)
+
+		loginReq := LoginUserReq{
+			Email:    user.Email,
+			Password: "password123", // Password asli sebelum di-hash
+		}
+
+		rr := th.makeRequest("POST", "/users/login", loginReq, "")
+
+		// Verifikasi response status
+		if rr.Code != http.StatusOK {
+			t.Errorf("Expected status %d, got %d", http.StatusOK, rr.Code)
+		}
+
+		// Parse response body
+		var response LoginUserRes
+		err := json.NewDecoder(rr.Body).Decode(&response)
+		if err != nil {
+			t.Fatalf("Failed to decode response: %v", err)
+		}
+
+		// Verifikasi response memiliki token
+		if response.AccessToken == "" {
+			t.Error("Expected access token, got empty string")
+		}
+		if response.RefreshToken == "" {
+			t.Error("Expected refresh token, got empty string")
+		}
+		if response.SessionID == "" {
+			t.Error("Expected session ID, got empty string")
+		}
+	})
+
+	// Test case 2: Gagal login dengan password salah
+	t.Run("Fail - Login with wrong password", func(t *testing.T) {
+		user, _ := th.createTestUser(t, false)
+
+		loginReq := LoginUserReq{
+			Email:    user.Email,
+			Password: "wrongpassword",
+		}
+
+		rr := th.makeRequest("POST", "/users/login", loginReq, "")
+
+		// Harus mendapat status Bad Request
+		if rr.Code != http.StatusBadRequest {
+			t.Errorf("Expected status %d, got %d", http.StatusBadRequest, rr.Code)
+		}
+	})
+}
+
+// TestListUsers menguji endpoint untuk mendapatkan daftar users (admin only)
+func TestListUsers(t *testing.T) {
+	th := setupTestHandler(t)
+
+	// Test case 1: Sukses mendapatkan daftar users sebagai admin
+	t.Run("Success - Admin lists users", func(t *testing.T) {
+		_, adminToken := th.createTestUser(t, true)
+		// Buat beberapa users tambahan
+		th.createTestUser(t, false)
+
+		rr := th.makeRequest("GET", "/users", nil, adminToken)
+
+		// Verifikasi response status
+		if rr.Code != http.StatusOK {
+			t.Errorf("Expected status %d, got %d", http.StatusOK, rr.Code)
+		}
+
+		// Parse response body
+		var response ListUserRes
+		err := json.NewDecoder(rr.Body).Decode(&response)
+		if err != nil {
+			t.Fatalf("Failed to decode response: %v", err)
+		}
+
+		// Verifikasi ada users dalam response
+		if len(response.Users) < 2 {
+			t.Errorf("Expected at least 2 users, got %d", len(response.Users))
+		}
+	})
+
+	// Test case 2: Gagal karena bukan admin
+	t.Run("Fail - Non-admin tries to list users", func(t *testing.T) {
+		_, userToken := th.createTestUser(t, false)
+
+		rr := th.makeRequest("GET", "/users", nil, userToken)
+
+		// Harus mendapat status Forbidden
+		if rr.Code != http.StatusForbidden {
+			t.Errorf("Expected status %d, got %d", http.StatusForbidden, rr.Code)
+		}
+	})
+}
+
+// TestUpdateUser menguji endpoint untuk mengupdate profil user
+func TestUpdateUser(t *testing.T) {
+	th := setupTestHandler(t)
+
+	// Test case 1: Sukses update profil sendiri
+	t.Run("Success - User updates own profile", func(t *testing.T) {
+		_, userToken := th.createTestUser(t, false)
+
+		updateReq := UserReq{
+			Name:     "Updated Name",
+			Email:    "updated@example.com",
+			Password: "newpassword123",
+			IsAdmin:  false,
+		}
+
+		rr := th.makeRequest("PATCH", "/users", updateReq, userToken)
+
+		// Verifikasi response status
+		if rr.Code != http.StatusOK {
+			t.Errorf("Expected status %d, got %d", http.StatusOK, rr.Code)
+		}
+
+		// Parse response body
+		var response UserRes
+		err := json.NewDecoder(rr.Body).Decode(&response)
+		if err != nil {
+			t.Fatalf("Failed to decode response: %v", err)
+		}
+
+		// Verifikasi data telah diupdate
+		if response.Name != updateReq.Name {
+			t.Errorf("Expected name %s, got %s", updateReq.Name, response.Name)
+		}
+	})
+}
+
+// TestDeleteUser menguji endpoint untuk menghapus user (admin only)
+func TestDeleteUser(t *testing.T) {
+	th := setupTestHandler(t)
+
+	// Test case 1: Sukses delete user sebagai admin
+	t.Run("Success - Admin deletes user", func(t *testing.T) {
+		_, adminToken := th.createTestUser(t, true)
+		userToDelete, _ := th.createTestUser(t, false)
+
+		rr := th.makeRequest("DELETE", "/users/"+strconv.Itoa(int(userToDelete.ID)), nil, adminToken)
+
+		// Verifikasi response status
+		if rr.Code != http.StatusNoContent {
+			t.Errorf("Expected status %d, got %d", http.StatusNoContent, rr.Code)
+		}
+	})
+}
+
+// TestLogoutUser menguji endpoint untuk logout user
+func TestLogoutUser(t *testing.T) {
+	th := setupTestHandler(t)
+
+	// Test case 1: Sukses logout
+	t.Run("Success - User logs out", func(t *testing.T) {
+		_, userToken := th.createTestUser(t, false)
+
+		rr := th.makeRequest("POST", "/users/logout", nil, userToken)
+
+		// Verifikasi response status
+		if rr.Code != http.StatusNoContent {
+			t.Errorf("Expected status %d, got %d", http.StatusNoContent, rr.Code)
+		}
+	})
+}
+
+// ==================== ORDER HANDLER TESTS ====================
+
+// TestCreateOrder menguji endpoint untuk membuat order baru
+func TestCreateOrder(t *testing.T) {
+	th := setupTestHandler(t)
+
+	// Test case 1: Sukses membuat order
+	t.Run("Success - Create new order", func(t *testing.T) {
+		_, userToken := th.createTestUser(t, false)
+		product := th.createTestProduct(t)
+
+		orderReq := OrderReq{
+			Items: []OrderItem{
+				{
+					Name:      product.Name,
+					Quantity:  2,
+					Image:     product.Image,
+					Price:     product.Price,
+					ProductID: product.ID,
+				},
+			},
+			PaymentMethod: "PayPal",
+			TaxPrice:      10.00,
+			ShippingPrice: 5.00,
+			TotalPrice:    214.98, // (99.99 * 2) + 10.00 + 5.00
+		}
+
+		rr := th.makeRequest("POST", "/orders", orderReq, userToken)
+
+		// Verifikasi response status
+		if rr.Code != http.StatusCreated {
+			t.Errorf("Expected status %d, got %d", http.StatusCreated, rr.Code)
+		}
+
+		// Parse response body
+		var response OrderRes
+		err := json.NewDecoder(rr.Body).Decode(&response)
+		if err != nil {
+			t.Fatalf("Failed to decode response: %v", err)
+		}
+
+		// Verifikasi data response
+		if response.TotalPrice != orderReq.TotalPrice {
+			t.Errorf("Expected total price %f, got %f", orderReq.TotalPrice, response.TotalPrice)
+		}
+		if len(response.Items) != len(orderReq.Items) {
+			t.Errorf("Expected %d items, got %d", len(orderReq.Items), len(response.Items))
+		}
+	})
+
+	// Test case 2: Gagal karena tidak ada authorization
+	t.Run("Fail - No authorization", func(t *testing.T) {
+		orderReq := OrderReq{
+			Items: []OrderItem{
+				{
+					Name:      "Test Product",
+					Quantity:  1,
+					Image:     "https://example.com/image.jpg",
+					Price:     99.99,
+					ProductID: 1,
+				},
+			},
+			PaymentMethod: "PayPal",
+			TaxPrice:      10.00,
+			ShippingPrice: 5.00,
+			TotalPrice:    114.99,
+		}
+
+		rr := th.makeRequest("POST", "/orders", orderReq, "")
+
+		// Harus mendapat status Unauthorized
+		if rr.Code != http.StatusUnauthorized {
+			t.Errorf("Expected status %d, got %d", http.StatusUnauthorized, rr.Code)
+		}
+	})
+}
+
+// TestGetOrder menguji endpoint untuk mendapatkan order user
+func TestGetOrder(t *testing.T) {
+	th := setupTestHandler(t)
+
+	// Test case 1: Sukses mendapatkan order milik sendiri
+	t.Run("Success - Get own order", func(t *testing.T) {
+		user, userToken := th.createTestUser(t, false)
+		product := th.createTestProduct(t)
+
+		// Buat order terlebih dahulu
+		order := &storer.Order{
+			UserID:        user.ID,
+			PaymentMethod: "PayPal",
+			TaxPrice:      10.00,
+			ShippingPrice: 5.00,
+			TotalPrice:    114.99,
+			Items: []storer.OrderItem{
+				{
+					Name:      product.Name,
+					Quantity:  1,
+					Image:     product.Image,
+					Price:     product.Price,
+					ProductID: product.ID,
+				},
+			},
+		}
+		_, err := th.testServer.CreateOrder(context.Background(), order)
+		if err != nil {
+			t.Fatalf("Failed to create test order: %v", err)
+		}
+
+		rr := th.makeRequest("GET", "/myorder", nil, userToken)
+
+		// Verifikasi response status
+		if rr.Code != http.StatusOK {
+			t.Errorf("Expected status %d, got %d", http.StatusOK, rr.Code)
+		}
+
+		// Parse response body
+		var response OrderRes
+		err = json.NewDecoder(rr.Body).Decode(&response)
+		if err != nil {
+			t.Fatalf("Failed to decode response: %v", err)
+		}
+
+		// Verifikasi data response
+		if response.TotalPrice != order.TotalPrice {
+			t.Errorf("Expected total price %f, got %f", order.TotalPrice, response.TotalPrice)
+		}
+	})
+}
+
+// TestListOrders menguji endpoint untuk mendapatkan semua orders (admin only)
+func TestListOrders(t *testing.T) {
+	th := setupTestHandler(t)
+
+	// Test case 1: Sukses mendapatkan semua orders sebagai admin
+	t.Run("Success - Admin lists all orders", func(t *testing.T) {
+		_, adminToken := th.createTestUser(t, true)
+		user, _ := th.createTestUser(t, false)
+		product := th.createTestProduct(t)
+
+		// Buat beberapa orders
+		order := &storer.Order{
+			UserID:        user.ID,
+			PaymentMethod: "PayPal",
+			TaxPrice:      10.00,
+			ShippingPrice: 5.00,
+			TotalPrice:    114.99,
+			Items: []storer.OrderItem{
+				{
+					Name:      product.Name,
+					Quantity:  1,
+					Image:     product.Image,
+					Price:     product.Price,
+					ProductID: product.ID,
+				},
+			},
+		}
+		_, err := th.testServer.CreateOrder(context.Background(), order)
+		if err != nil {
+			t.Fatalf("Failed to create test order: %v", err)
+		}
+
+		rr := th.makeRequest("GET", "/orders", nil, adminToken)
+
+		// Verifikasi response status
+		if rr.Code != http.StatusOK {
+			t.Errorf("Expected status %d, got %d", http.StatusOK, rr.Code)
+		}
+
+		// Parse response body
+		var response []OrderRes
+		err = json.NewDecoder(rr.Body).Decode(&response)
+		if err != nil {
+			t.Fatalf("Failed to decode response: %v", err)
+		}
+
+		// Verifikasi ada orders dalam response
+		if len(response) < 1 {
+			t.Errorf("Expected at least 1 order, got %d", len(response))
+		}
+	})
+}
+
+// TestDeleteOrder menguji endpoint untuk menghapus order
+func TestDeleteOrder(t *testing.T) {
+	th := setupTestHandler(t)
+
+	// Test case 1: Sukses delete order milik sendiri
+	t.Run("Success - Delete own order", func(t *testing.T) {
+		user, userToken := th.createTestUser(t, false)
+		product := th.createTestProduct(t)
+
+		// Buat order terlebih dahulu
+		order := &storer.Order{
+			UserID:        user.ID,
+			PaymentMethod: "PayPal",
+			TaxPrice:      10.00,
+			ShippingPrice: 5.00,
+			TotalPrice:    114.99,
+			Items: []storer.OrderItem{
+				{
+					Name:      product.Name,
+					Quantity:  1,
+					Image:     product.Image,
+					Price:     product.Price,
+					ProductID: product.ID,
+				},
+			},
+		}
+		createdOrder, err := th.testServer.CreateOrder(context.Background(), order)
+		if err != nil {
+			t.Fatalf("Failed to create test order: %v", err)
+		}
+
+		rr := th.makeRequest("DELETE", "/orders/"+strconv.Itoa(int(createdOrder.ID)), nil, userToken)
+
+		// Verifikasi response status
+		if rr.Code != http.StatusNoContent {
+			t.Errorf("Expected status %d, got %d", http.StatusNoContent, rr.Code)
+		}
+	})
+}
+
+// ==================== TOKEN HANDLER TESTS ====================
+
+// TestRenewAccessToken menguji endpoint untuk memperbaharui access token
+func TestRenewAccessToken(t *testing.T) {
+	th := setupTestHandler(t)
+
+	// Test case 1: Sukses renew access token
+	t.Run("Success - Renew access token", func(t *testing.T) {
+		user, _ := th.createTestUser(t, false)
+
+		// Buat refresh token
+		refreshToken, refreshClaims, err := th.handler.TokenMaker.CreateToken(
+			user.ID,
+			user.Email,
+			user.IsAdmin,
+			24*time.Hour,
+		)
+		if err != nil {
+			t.Fatalf("Failed to create refresh token: %v", err)
+		}
+
+		// Buat session
+		session := &storer.Session{
+			ID:           refreshClaims.RegisteredClaims.ID,
+			UserEmail:    user.Email,
+			RefreshToken: refreshToken,
+			IsRevoked:    false,
+			ExpiresAt:    refreshClaims.RegisteredClaims.ExpiresAt.Time,
+		}
+		_, err = th.testServer.CreateSession(context.Background(), session)
+		if err != nil {
+			t.Fatalf("Failed to create session: %v", err)
+		}
+
+		renewReq := RenewAccessTokenReq{
+			RefreshToken: refreshToken,
+		}
+
+		// Buat access token untuk authorization
+		accessToken, _, err := th.handler.TokenMaker.CreateToken(
+			user.ID,
+			user.Email,
+			user.IsAdmin,
+			time.Hour,
+		)
+		if err != nil {
+			t.Fatalf("Failed to create access token: %v", err)
+		}
+
+		rr := th.makeRequest("POST", "/tokens/renew", renewReq, accessToken)
+
+		// Verifikasi response status
+		if rr.Code != http.StatusOK {
+			t.Errorf("Expected status %d, got %d", http.StatusOK, rr.Code)
+		}
+
+		// Parse response body
+		var response RenewAccessTokenRes
+		err = json.NewDecoder(rr.Body).Decode(&response)
+		if err != nil {
+			t.Fatalf("Failed to decode response: %v", err)
+		}
+
+		// Verifikasi response memiliki access token baru
+		if response.AccessToken == "" {
+			t.Error("Expected new access token, got empty string")
+		}
+	})
+}
+
+// TestRevokeSession menguji endpoint untuk merevoke session
+func TestRevokeSession(t *testing.T) {
+	th := setupTestHandler(t)
+
+	// Test case 1: Sukses revoke session
+	t.Run("Success - Revoke session", func(t *testing.T) {
+		user, _ := th.createTestUser(t, false)
+
+		// Buat access token
+		accessToken, accessClaims, err := th.handler.TokenMaker.CreateToken(
+			user.ID,
+			user.Email,
+			user.IsAdmin,
+			time.Hour,
+		)
+		if err != nil {
+			t.Fatalf("Failed to create access token: %v", err)
+		}
+
+		// Buat session
+		session := &storer.Session{
+			ID:           accessClaims.RegisteredClaims.ID,
+			UserEmail:    user.Email,
+			RefreshToken: "dummy-refresh-token",
+			IsRevoked:    false,
+			ExpiresAt:    time.Now().Add(24 * time.Hour),
+		}
+		_, err = th.testServer.CreateSession(context.Background(), session)
+		if err != nil {
+			t.Fatalf("Failed to create session: %v", err)
+		}
+
+		rr := th.makeRequest("POST", "/tokens/revoke", nil, accessToken)
+
+		// Verifikasi response status
+		if rr.Code != http.StatusNoContent {
+			t.Errorf("Expected status %d, got %d", http.StatusNoContent, rr.Code)
+		}
+	})
+}
+
+// ==================== HELPER TESTS ====================
+
+// TestAuthMiddleware menguji middleware authentication
+func TestAuthMiddleware(t *testing.T) {
+	th := setupTestHandler(t)
+
+	// Test case 1: Request tanpa authorization header
+	t.Run("Fail - No authorization header", func(t *testing.T) {
+		rr := th.makeRequest("GET", "/myorder", nil, "")
+
+		// Harus mendapat status Unauthorized
+		if rr.Code != http.StatusUnauthorized {
+			t.Errorf("Expected status %d, got %d", http.StatusUnauthorized, rr.Code)
+		}
+	})
+
+	// Test case 2: Request dengan invalid token
+	t.Run("Fail - Invalid token", func(t *testing.T) {
+		rr := th.makeRequest("GET", "/myorder", nil, "invalid-token")
+
+		// Harus mendapat status Unauthorized
+		if rr.Code != http.StatusUnauthorized {
+			t.Errorf("Expected status %d, got %d", http.StatusUnauthorized, rr.Code)
+		}
+	})
+}
+
+// TestAdminMiddleware menguji middleware admin authorization
+func TestAdminMiddleware(t *testing.T) {
+	th := setupTestHandler(t)
+
+	// Test case 1: Non-admin mencoba akses endpoint admin
+	t.Run("Fail - Non-admin access admin endpoint", func(t *testing.T) {
+		_, userToken := th.createTestUser(t, false)
+
+		productReq := ProductReq{
+			Name:         "Test Product",
+			Image:        "https://example.com/image.jpg",
+			Category:     "Electronics",
+			Description:  "Test description",
+			Rating:       5,
+			NumReviews:   10,
+			Price:        99.99,
+			CountInStock: 50,
+		}
+
+		rr := th.makeRequest("POST", "/products", productReq, userToken)
+
+		// Harus mendapat status Forbidden
+		if rr.Code != http.StatusForbidden {
+			t.Errorf("Expected status %d, got %d", http.StatusForbidden, rr.Code)
+		}
+	})
+}
+
+// Benchmark tests untuk mengukur performa
+func BenchmarkCreateProduct(b *testing.B) {
+	th := setupTestHandler(&testing.T{})
+	_, adminToken := th.createTestUser(&testing.T{}, true)
+
+	productReq := ProductReq{
+		Name:         "Benchmark Product",
+		Image:        "https://example.com/image.jpg",
+		Category:     "Electronics",
+		Description:  "Benchmark test",
+		Rating:       5,
+		NumReviews:   10,
+		Price:        99.99,
+		CountInStock: 50,
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		// Update nama product agar tidak konflik
+		productReq.Name = fmt.Sprintf("Benchmark Product %d", i)
+		th.makeRequest("POST", "/products", productReq, adminToken)
+	}
+}
+
+func BenchmarkListProducts(b *testing.B) {
+	th := setupTestHandler(&testing.T{})
+	
+	// Buat beberapa products untuk di-list
+	for i := 0; i < 10; i++ {
+		th.createTestProduct(&testing.T{})
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		th.makeRequest("GET", "/products", nil, "")
+	}
+}
